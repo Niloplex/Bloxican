@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>CosmicTap</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden; /* Prevent scroll bars on mobile */
+      background: #000000;
+    }
+    #gameCanvas {
+      display: block;
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      touch-action: none; /* Helps with pointer/touch events */
+      background: #111111;
+    }
+    #score {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      font: bold 24px sans-serif;
+      color: #FFFFFF;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas"></canvas>
+  <div id="score">Score: 0</div>
+
+  <script type="text/javascript">
+    //======================//
+    //   COSMIC TAP GAME    //
+    //======================//
+    (function() {
+      // -- DOM Elements
+      const canvas = document.getElementById("gameCanvas");
+      const scoreDisplay = document.getElementById("score");
+
+      let gl;
+      let devicePixelRatio = window.devicePixelRatio || 1;
+      let score = 0;
+
+      // Orbs (entities) data
+      const orbs = [];
+      const MAX_ORBS = 20;
+      const ORB_SIZE = 0.05; // relative to view size
+      const SPAWN_INTERVAL = 1500; // ms
+      let lastSpawnTime = 0;
+
+      // Time tracking
+      let lastFrameTime = 0;
+
+      // --- Shaders (GLSL) ---
+      // Vertex shader: transforms positions + passes point size & color
+      const vertexShaderSource = `#version 300 es
+      precision mediump float;
+
+      in vec2 aPosition;
+      in vec3 aColor;
+      uniform float uPointSize;
+      uniform mat4 uProjection;
+
+      out vec3 vColor;
+
+      void main() {
+          vColor = aColor;
+          gl_Position = uProjection * vec4(aPosition, 0.0, 1.0);
+          // gl_PointSize is used for rendering points
+          gl_PointSize = uPointSize;
+      }
+      `;
+
+      // Fragment shader: color each orb
+      // We'll use a soft circular shape in the fragment.
+      const fragmentShaderSource = `#version 300 es
+      precision mediump float;
+
+      in vec3 vColor;
+      out vec4 outColor;
+
+      void main() {
+          // Distance from center of the point
+          float dist = distance(gl_PointCoord, vec2(0.5, 0.5));
+          // Create a soft edge around the circle
+          float alpha = 1.0 - smoothstep(0.45, 0.5, dist);
+          outColor = vec4(vColor, alpha);
+      }
+      `;
+
+      // Utility: Compile a shader
+      function compileShader(source, type) {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+          console.error('Shader error:', gl.getShaderInfoLog(shader));
+          gl.deleteShader(shader);
+          return null;
+        }
+        return shader;
+      }
+
+      // Utility: Link vertex & fragment shader into a program
+      function createProgram(vsSource, fsSource) {
+        const vs = compileShader(vsSource, gl.VERTEX_SHADER);
+        const fs = compileShader(fsSource, gl.FRAGMENT_SHADER);
+        if (!vs || !fs) return null;
+
+        const program = gl.createProgram();
+        gl.attachShader(program, vs);
+        gl.attachShader(program, fs);
+        gl.linkProgram(program);
+
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+          console.error('Program link error:', gl.getProgramInfoLog(program));
+          gl.deleteProgram(program);
+          return null;
+        }
+        // Cleanup
+        gl.deleteShader(vs);
+        gl.deleteShader(fs);
+        return program;
+      }
+
+      // Initialize WebGL
+      function initWebGL() {
+        gl = canvas.getContext("webgl2", { alpha: false });
+        if (!gl) {
+          alert("WebGL 2.0 is not supported in this browser.");
+          return;
+        }
+
+        // Adjust size and viewport
+        resizeCanvas();
+        window.addEventListener('resize', resizeCanvas);
+
+        // Enable alpha blending for circle edges
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+        // Set clear color
+        gl.clearColor(0.0, 0.0, 0.0, 1.0);
+      }
+
+      // Resize the canvas to full window
+      function resizeCanvas() {
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+        canvas.width = w * devicePixelRatio;
+        canvas.height = h * devicePixelRatio;
+        canvas.style.width = w + 'px';
+        canvas.style.height = h + 'px';
+        gl.viewport(0, 0, canvas.width, canvas.height);
+      }
+
+      // Create program + setup attribute/uniform locations
+      let program;
+      let aPositionLoc, aColorLoc, uProjectionLoc, uPointSizeLoc;
+      let buffer, colorBuffer;
+
+      function initShadersAndBuffers() {
+        program = createProgram(vertexShaderSource, fragmentShaderSource);
+        gl.useProgram(program);
+
+        // Look up attribute and uniform locations
+        aPositionLoc = gl.getAttribLocation(program, 'aPosition');
+        aColorLoc = gl.getAttribLocation(program, 'aColor');
+        uProjectionLoc = gl.getUniformLocation(program, 'uProjection');
+        uPointSizeLoc = gl.getUniformLocation(program, 'uPointSize');
+
+        // Create buffers
+        buffer = gl.createBuffer();
+        colorBuffer = gl.createBuffer();
+      }
+
+      // Simple orthographic projection matrix
+      function makeProjectionMatrix(width, height) {
+        // Converts from [0, w]x[0, h] to [-1,1]x[-1,1]
+        // We can also make it symmetrical so that center is (0,0).
+        // Let's do symmetrical to handle positions in range [-1,1].
+        // aspect ratio approach: We'll just do identity if we handle
+        // clip space in [-1, 1].
+        // We'll rely on orb positions to be in [-1,1].
+        return [
+          1, 0, 0, 0,
+          0, 1, 0, 0,
+          0, 0, 1, 0,
+          0, 0, 0, 1,
+        ];
+      }
+
+      // Generate an orb
+      function createOrb() {
+        // Random position in range [-1,1]
+        const x = (Math.random() * 2) - 1;
+        const y = (Math.random() * 2) - 1;
+
+        // Random color
+        const r = 0.5 + 0.5 * Math.random();
+        const g = 0.5 + 0.5 * Math.random();
+        const b = 0.5 + 0.5 * Math.random();
+
+        // Random velocity
+        const vx = (Math.random() - 0.5) * 0.0005;
+        const vy = (Math.random() - 0.5) * 0.0005;
+
+        return {
+          x, y, r, g, b, vx, vy
+        };
+      }
+
+      // Update orb positions, remove if outside bounds
+      function updateOrbs(delta) {
+        for (let i = orbs.length - 1; i >= 0; i--) {
+          const orb = orbs[i];
+          orb.x += orb.vx * delta;
+          orb.y += orb.vy * delta;
+
+          // If orb drifts too far out of [-1.2, 1.2], remove it
+          if (orb.x < -1.2 || orb.x > 1.2 || orb.y < -1.2 || orb.y > 1.2) {
+            orbs.splice(i, 1);
+          }
+        }
+      }
+
+      // Render orbs
+      function renderOrbs() {
+        // Prepare data arrays
+        const positions = [];
+        const colors = [];
+
+        for (let i = 0; i < orbs.length; i++) {
+          const orb = orbs[i];
+          positions.push(orb.x, orb.y);
+          colors.push(orb.r, orb.g, orb.b);
+        }
+
+        // Bind position buffer data
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(aPositionLoc);
+        gl.vertexAttribPointer(aPositionLoc, 2, gl.FLOAT, false, 0, 0);
+
+        // Bind color buffer data
+        gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(colors), gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(aColorLoc);
+        gl.vertexAttribPointer(aColorLoc, 3, gl.FLOAT, false, 0, 0);
+
+        // Set the uniform matrix
+        const projectionMatrix = makeProjectionMatrix(canvas.width, canvas.height);
+        gl.uniformMatrix4fv(uProjectionLoc, false, projectionMatrix);
+
+        // Determine point size in device pixels
+        const pointSize = ORB_SIZE * Math.min(canvas.width, canvas.height);
+        gl.uniform1f(uPointSizeLoc, pointSize);
+
+        // Draw points
+        gl.drawArrays(gl.POINTS, 0, orbs.length);
+      }
+
+      // Game loop
+      function gameLoop(timestamp) {
+        const delta = timestamp - lastFrameTime;
+        lastFrameTime = timestamp;
+
+        // Clear the screen
+        gl.clear(gl.COLOR_BUFFER_BIT);
+
+        // Spawn orbs at interval
+        if (timestamp - lastSpawnTime >= SPAWN_INTERVAL && orbs.length < MAX_ORBS) {
+          orbs.push(createOrb());
+          lastSpawnTime = timestamp;
+        }
+
+        // Update orbs
+        updateOrbs(delta);
+
+        // Render orbs
+        gl.useProgram(program);
+        renderOrbs();
+
+        // Request next frame
+        requestAnimationFrame(gameLoop);
+      }
+
+      // Convert screen coords to clip space coords
+      function toClipSpace(clientX, clientY) {
+        const rect = canvas.getBoundingClientRect();
+        const x = ((clientX - rect.left) / rect.width) * 2 - 1;
+        const y = 1 - ((clientY - rect.top) / rect.height) * 2;
+        return { x, y };
+      }
+
+      // Handle tapping/clicking
+      function handleTap(clientX, clientY) {
+        const { x, y } = toClipSpace(clientX, clientY);
+
+        // Check if (x,y) is close enough to an orb
+        const threshold = ORB_SIZE * 0.5; 
+        for (let i = orbs.length - 1; i >= 0; i--) {
+          const orb = orbs[i];
+          const dx = orb.x - x;
+          const dy = orb.y - y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          // If inside radius, pop it
+          if (dist < threshold) {
+            // Increase score
+            score += 10;
+            scoreDisplay.textContent = 'Score: ' + score;
+            // Remove orb
+            orbs.splice(i, 1);
+            // We only remove one orb per tap
+            break;
+          }
+        }
+      }
+
+      // Attach event listeners (touch + mouse)
+      canvas.addEventListener("click", (e) => {
+        handleTap(e.clientX, e.clientY);
+      });
+      canvas.addEventListener("touchstart", (e) => {
+        e.preventDefault();
+        const touches = e.changedTouches;
+        for (let i = 0; i < touches.length; i++) {
+          handleTap(touches[i].clientX, touches[i].clientY);
+        }
+      });
+
+      // Initialize and start
+      initWebGL();
+      initShadersAndBuffers();
+
+      requestAnimationFrame((t) => {
+        lastFrameTime = t;
+        requestAnimationFrame(gameLoop);
+      });
+    })();
+  </script>
+</body>
+</html>
